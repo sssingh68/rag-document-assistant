@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RAG Document Assistant</title>
+  <style>
+    body {
+      background-color: #0f172a;
+      color: #e2e8f0;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      height: 100vh;
+      margin: 0;
+      padding: 2rem;
+      gap: 2rem;
+    }
+    .card {
+      background-color: #1e293b;
+      border-radius: 16px;
+      box-shadow: 0 0 15px rgba(0,0,0,0.2);
+      padding: 2rem;
+      width: 420px;
+    }
+    h1 {
+      text-align: center;
+      color: #93c5fd;
+    }
+    input[type="file"] {
+      width: 100%;
+      margin-bottom: 1rem;
+    }
+    button {
+      background: linear-gradient(to right, #3b82f6, #6366f1);
+      color: white;
+      border: none;
+      padding: 0.7rem 1.2rem;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    button:hover {
+      background: linear-gradient(to right, #2563eb, #4f46e5);
+    }
+    .uploaded-files {
+      margin-top: 1rem;
+      font-size: 0.9rem;
+      color: #a5b4fc;
+    }
+    .chat-box {
+      margin-top: 1rem;
+      background: #0f172a;
+      border-radius: 12px;
+      padding: 1rem;
+      max-height: 60vh;
+      overflow-y: auto;
+    }
+    .msg {
+      margin: 0.5rem 0;
+    }
+    .msg.user {
+      color: #a5b4fc;
+      font-weight: 600;
+    }
+    .msg.bot {
+      color: #e2e8f0;
+    }
+    input[type="text"] {
+      width: 80%;
+      padding: 0.6rem;
+      border-radius: 6px;
+      border: 1px solid #334155;
+      background: #1e293b;
+      color: white;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>📄 Upload PDF(s)</h1>
+    <input type="file" id="fileInput" multiple />
+    <button onclick="upload()">Upload</button>
+    <div class="uploaded-files" id="uploadedFiles"></div>
+  </div>
+
+  <div class="card">
+    <h1>💬 RAG Document Assistant</h1>
+    <div class="chat-box" id="chatBox"></div>
+    <div style="margin-top:1rem;">
+      <input type="text" id="question" placeholder="Ask about uploaded documents..." />
+      <button onclick="ask()">Ask</button>
+    </div>
+  </div>
+
+  <script>
+    const chatBox = document.getElementById('chatBox');
+    const uploadedDiv = document.getElementById('uploadedFiles');
+    const baseUrl = window.location.origin;
+
+    async function upload() {
+      const files = document.getElementById('fileInput').files;
+      if (!files.length) return alert("Please select a file");
+      for (let f of files) {
+        const formData = new FormData();
+        formData.append("file", f);
+        const res = await fetch(`${baseUrl}/upload`, { method: "POST", body: formData });
+        const j = await res.json();
+        uploadedDiv.innerHTML += `<div>📁 ${f.name} → ${j.msg}</div>`;
+      }
+    }
+
+    async function ask() {
+      const question = document.getElementById('question').value.trim();
+      if (!question) return;
+      chatBox.innerHTML += `<div class="msg user">🧑: ${question}</div>`;
+      const res = await fetch(`${baseUrl}/ask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: question, show_sources: true })
+      });
+      const j = await res.json();
+      chatBox.innerHTML += `<div class="msg bot">🤖: ${j.answer || "No response"}<br><small>${(j.sources || []).join("<br>")}</small></div>`;
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+  </script>
+</body>
+</html>

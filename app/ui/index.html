@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>RAG Document Assistant</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+  /* ---- Embedded styles (dark modern theme) ---- */
+  :root{
+    --bg:#071016;
+    --panel:#0f1720;
+    --muted:#98a7b7;
+    --accent:#2563eb;
+    --accent-2:#9be1ff;
+    --card-shadow: 0 10px 30px rgba(0,0,0,0.6);
+    --radius:12px;
+    --max-width:1200px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:linear-gradient(180deg,#061018,#071422);color:#e6eef6}
+  .topbar{display:flex;align-items:center;justify-content:center;padding:22px 0 8px}
+  .brand{display:flex;align-items:center;gap:12px}
+  .logo{font-size:30px;transform:translateY(2px)}
+  .brand h1{margin:0;font-size:28px;color:var(--accent-2);letter-spacing:0.4px}
+
+  .layout{max-width:var(--max-width);margin:18px auto;display:flex;gap:28px;padding:16px}
+  .left{flex:0 0 360px;display:flex;flex-direction:column;gap:18px}
+  .right{flex:1}
+
+  .card{background:var(--panel);border-radius:var(--radius);padding:16px;box-shadow:var(--card-shadow);border:1px solid rgba(255,255,255,0.03)}
+  h2{margin:0 0 8px 0;font-size:18px;color:#cfe8ff}
+  .upload-form{display:flex;gap:8px;align-items:center}
+  input[type=file]{color:var(--muted)}
+  .btn{background:transparent;border:1px solid rgba(255,255,255,0.06);color:#dfefff;padding:8px 12px;border-radius:8px;cursor:pointer}
+  .btn.primary{background:var(--accent);border-color:transparent;color:#fff}
+  .btn.big{padding:12px 18px;font-weight:600;border-radius:10px}
+
+  .muted{color:var(--muted);font-size:13px;margin-top:8px}
+  .files-list{max-height:540px;overflow:auto;padding-right:6px}
+  .files-list ul{margin:0;padding-left:18px;color:#cfe5ff}
+  .files-list li{margin:6px 0;font-size:14px;word-break:break-all}
+
+  .chat-card{display:flex;flex-direction:column;gap:12px;height:700px}
+  .controls{display:flex;gap:10px;align-items:center}
+  .responses{flex:1;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.02));border-radius:10px;padding:12px;overflow:auto;border:1px solid rgba(255,255,255,0.03)}
+  .response{background: rgba(15,25,35,0.6);border-radius:8px;padding:12px;margin-bottom:12px;color:#e7f0ff;line-height:1.45;box-shadow:0 4px 12px rgba(0,0,0,0.4)}
+  .response .meta{color:var(--muted);font-size:12px;margin-bottom:8px}
+  .ask-row{display:flex;gap:10px;align-items:center;margin-top:6px}
+  .ask-row input{flex:1;padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:#071024;color:#e6eef6}
+  .footer{max-width:var(--max-width);margin:18px auto;text-align:center;padding:8px;font-size:12px;color:var(--muted)}
+
+  /* responsiveness */
+  @media(max-width:900px){
+    .layout{padding:12px;gap:12px;flex-direction:column}
+    .left{flex:0 0 auto}
+    .chat-card{height:480px}
+  }
+
+  /* small utilities */
+  .small-muted{font-size:12px;color:var(--muted)}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🧠</span>
+      <h1>RAG Document Assistant</h1>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="left">
+      <div class="card upload-card">
+        <h2>Upload PDF / TXT</h2>
+        <form id="uploadForm" class="upload-form">
+          <input id="fileInput" type="file" accept=".pdf,.txt" />
+          <button id="uploadBtn" type="submit" class="btn primary">Upload</button>
+        </form>
+        <p id="uploadMsg" class="muted"></p>
+      </div>
+
+      <div class="card files-card">
+        <h2>Uploaded Files</h2>
+        <div id="filesList" class="files-list">Loading...</div>
+      </div>
+    </section>
+
+    <section class="right">
+      <div class="card chat-card">
+        <div class="controls">
+          <button id="summarizeBtn" class="btn primary big">Summarise the uploaded document</button>
+          <div style="flex:1"></div>
+          <div class="small-muted">Local demo • Ollama / Chroma</div>
+        </div>
+
+        <div id="responses" class="responses"></div>
+
+        <div class="ask-row">
+          <input id="question" type="text" placeholder="Ask a question..." />
+          <button id="askBtn" class="btn">Ask</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer muted">Running locally — hard refresh (Ctrl+F5) if UI doesn't update.</footer>
+
+<script>
+/* ---- Embedded JS: API helpers and UI logic ---- */
+
+function nowStr() {
+  return new Date().toLocaleTimeString();
+}
+
+async function apiFetch(path, opts={}) {
+  const res = await fetch(path, opts);
+  // try json even on non-ok to surface server error messages
+  let text;
+  try { text = await res.text(); } catch(e){ text = ''; }
+  if (!res.ok) {
+    // attempt to parse JSON
+    let parsed;
+    try { parsed = JSON.parse(text); } catch(e) { parsed = text; }
+    throw new Error(`${res.status} ${res.statusText} — ${JSON.stringify(parsed)}`);
+  }
+  try { return JSON.parse(text); } catch(e){ return text; }
+}
+
+function prependResponse(content, meta='') {
+  const out = document.getElementById('responses');
+  const wrapper = document.createElement('div');
+  wrapper.className = 'response';
+  if (meta) {
+    const m = document.createElement('div'); m.className = 'meta'; m.innerText = meta;
+    wrapper.appendChild(m);
+  }
+  const c = document.createElement('div');
+  if (typeof content === 'string') c.innerText = content;
+  else c.innerText = JSON.stringify(content, null, 2);
+  wrapper.appendChild(c);
+  // insert at top
+  out.insertBefore(wrapper, out.firstChild);
+}
+
+async function fetchFiles() {
+  const el = document.getElementById('filesList');
+  try {
+    const j = await apiFetch('/files');
+    if (!j || !j.ok) {
+      el.innerText = 'Error reading files';
+      return;
+    }
+    const files = j.files || [];
+    if (files.length === 0) {
+      el.innerHTML = '<em>No files uploaded</em>';
+      return;
+    }
+    const ul = document.createElement('ul');
+    files.forEach(f => {
+      const li = document.createElement('li');
+      li.innerText = f;
+      ul.appendChild(li);
+    });
+    el.innerHTML = '';
+    el.appendChild(ul);
+  } catch (err) {
+    el.innerText = 'Error: ' + (err.message || err);
+  }
+}
+
+document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fi = document.getElementById('fileInput');
+  if (!fi.files || fi.files.length === 0) { alert('Choose a file'); return; }
+  const fd = new FormData();
+  fd.append('file', fi.files[0]);
+  document.getElementById('uploadMsg').innerText = 'Uploading...';
+  try {
+    const resp = await fetch('/upload', { method:'POST', body: fd });
+    const j = await resp.json();
+    document.getElementById('uploadMsg').innerText = j.msg || JSON.stringify(j);
+    // refresh files listing
+    await fetchFiles();
+    // clear file input
+    fi.value = '';
+  } catch (err) {
+    document.getElementById('uploadMsg').innerText = 'Upload error: ' + (err.message || err);
+  }
+});
+
+document.getElementById('askBtn').addEventListener('click', async () => {
+  const q = document.getElementById('question').value.trim();
+  if (!q) { alert('Type a question'); return; }
+  prependResponse('…', `You • ${nowStr()}`);
+  try {
+    const j = await apiFetch('/ask', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ question: q })
+    });
+    // backend returns JSON like { ok: true, answer: "..."} or { ok:true, text:"..." }
+    const answer = j.answer || j.text || j || 'No answer';
+    prependResponse(answer, `Assistant • ${nowStr()}`);
+  } catch (err) {
+    prependResponse('Error: ' + (err.message || err), `Assistant • ${nowStr()}`);
+  }
+});
+
+document.getElementById('summarizeBtn').addEventListener('click', async () => {
+  prependResponse('Requesting summary…', `You • ${nowStr()}`);
+  try {
+    const j = await apiFetch('/ask', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ question: 'summarize the document' })
+    });
+    const ans = j.answer || j.text || j || 'No summary';
+    prependResponse(ans, `Assistant (summary) • ${nowStr()}`);
+  } catch (err) {
+    prependResponse('Error: ' + (err.message || err), `Assistant • ${nowStr()}`);
+  }
+});
+
+// keyboard shortcut: Enter in question input triggers Ask
+document.getElementById('question').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    document.getElementById('askBtn').click();
+  }
+});
+
+// initialize
+window.addEventListener('load', () => {
+  fetchFiles();
+});
+</script>
+</body>
+</html>

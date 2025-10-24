@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>RAG Chatbot — Demo</title>
+  <style>
+    body{font-family:system-ui,Arial;margin:0;padding:0;background:#f6f8fb;color:#111}
+    .container{max-width:980px;margin:24px auto;padding:20px;background:white;border-radius:8px;box-shadow:0 6px 18px rgba(20,30,60,0.08)}
+    h1{font-size:20px;margin:0 0 8px}
+    p.lead{margin:0 0 12px;color:#4b5563}
+    textarea, input[type="text"], input[type="file"]{width:100%;padding:10px;border-radius:6px;border:1px solid #e6e9ef;font-size:14px}
+    button{background:#2b6cb0;color:white;padding:10px 14px;border:none;border-radius:6px;cursor:pointer}
+    .response{margin-top:16px;padding:12px;border-radius:6px;background:#f1f6ff;border:1px solid #e3eefc}
+    .sources{margin-top:10px;padding:10px;border-radius:6px;background:#fff7ed;border:1px solid #ffecb5}
+    .meta{font-size:12px;color:#6b7280}
+    .row{display:flex;gap:12px}
+    .uploads{margin-top:12px}
+    .upload-item{padding:8px;border-radius:6px;border:1px dashed #e6e9ef;margin-bottom:8px}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>RAG Chatbot — Demo (Upload PDFs/TXT)</h1>
+    <p class="lead">Upload a PDF or TXT. The app indexes it and you can ask questions about the content.</p>
+
+    <form id="uploadForm" onsubmit="return false;">
+      <input type="file" id="fileInput" accept=".pdf,.txt" />
+      <div style="display:flex;justify-content:flex-end;margin-top:8px">
+        <button type="button" id="uploadBtn">Upload & Ingest</button>
+      </div>
+    </form>
+
+    <div class="uploads" id="uploadsList">
+      <h3>Uploaded files</h3>
+      {% if uploads %}
+        {% for f in uploads %}
+          <div class="upload-item">{{ f.name }} — {{ f.size }} bytes</div>
+        {% endfor %}
+      {% else %}
+        <div class="meta">No files uploaded yet.</div>
+      {% endif %}
+    </div>
+
+    <hr style="margin:18px 0" />
+
+    <label class="meta">Your question</label>
+    <textarea id="question" rows="3" placeholder="Type: What is this document about?"></textarea>
+
+    <div style="display:flex;align-items:center;margin-top:10px;gap:8px">
+      <label style="display:flex;align-items:center;gap:6px"><input id="showSources" type="checkbox"/> Show retrieved context</label>
+      <div style="flex:1"></div>
+      <button id="askBtn">Ask</button>
+    </div>
+
+    <div id="result" class="response" style="display:none"></div>
+    <div id="sources" class="sources" style="display:none"></div>
+    <div style="margin-top:12px" class="meta">Tip: Use short questions. For production, add auth and rate limiting.</div>
+  </div>
+
+<script>
+const askBtn = document.getElementById('askBtn')
+const questionEl = document.getElementById('question')
+const resultEl = document.getElementById('result')
+const sourcesEl = document.getElementById('sources')
+const showSources = document.getElementById('showSources')
+
+const uploadBtn = document.getElementById('uploadBtn')
+const fileInput = document.getElementById('fileInput')
+
+async function ask() {
+  const q = questionEl.value.trim()
+  if(!q){ alert('Please type a question'); return; }
+  askBtn.disabled = true
+  askBtn.textContent = 'Thinking...'
+  resultEl.style.display = 'block'
+  resultEl.textContent = 'Thinking...'
+  sourcesEl.style.display = 'none'
+  sourcesEl.innerHTML = ''
+  try {
+    const resp = await fetch('/ask', {
+      method:'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({question: q, show_sources: showSources.checked})
+    })
+    const data = await resp.json()
+    if(data.error){
+      resultEl.textContent = 'Error: ' + data.error
+    } else {
+      resultEl.innerHTML = data.answer.replace(/\n/g,'<br/>')
+      if(showSources.checked && data.sources && data.sources.length){
+        sourcesEl.style.display = 'block'
+        sourcesEl.innerHTML = '<strong>Retrieved Context (excerpts):</strong><ul>' + data.sources.map(s => '<li>'+s+'</li>').join('') + '</ul>'
+      }
+    }
+  } catch(err){
+    resultEl.textContent = 'Network error: ' + err.message
+  } finally {
+    askBtn.disabled = false
+    askBtn.textContent = 'Ask'
+  }
+}
+
+askBtn.addEventListener('click', ask)
+questionEl.addEventListener('keydown', (e)=>{
+  if(e.key === 'Enter' && (e.ctrlKey || e.metaKey)) ask()
+})
+
+uploadBtn.addEventListener('click', async ()=>{
+  const f = fileInput.files[0]
+  if(!f){ alert('Choose a PDF or TXT file first'); return; }
+  uploadBtn.disabled = true
+  uploadBtn.textContent = 'Uploading...'
+  const form = new FormData()
+  form.append('file', f)
+  try {
+    const res = await fetch('/upload', { method:'POST', body: form })
+    const data = await res.json()
+    if(data.ok){
+      alert('Uploaded & ingestion scheduled: ' + data.msg)
+      location.reload()
+    } else {
+      alert('Upload error: ' + data.msg)
+    }
+  } catch(err){
+    alert('Network error: ' + err.message)
+  } finally {
+    uploadBtn.disabled = false
+    uploadBtn.textContent = 'Upload & Ingest'
+  }
+})
+</script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+fastapi==0.95.2
+uvicorn==0.22.0
+python-multipart==0.0.6
+requests==2.32.3
+numpy==1.26.4
+sentence-transformers==2.2.2
+chromadb==0.5.5
+PyPDF2==3.0.1
+ollama==0.3.0
+# Note: sentence-transformers will pull transformers/torch/etc as deps.

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>RAG Document Assistant</title>
+<style>
+  body {
+    font-family: 'Segoe UI', sans-serif;
+    background-color: #0b1120;
+    color: #e2e8f0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  h1 {
+    margin-top: 2rem;
+    font-size: 1.8rem;
+    color: #93c5fd;
+  }
+  #container {
+    display: flex;
+    width: 90%;
+    margin-top: 2rem;
+    gap: 1.5rem;
+  }
+  #upload {
+    flex: 1;
+    background: #1e293b;
+    padding: 1.5rem;
+    border-radius: 12px;
+  }
+  #chat {
+    flex: 2;
+    background: #1e293b;
+    padding: 1.5rem;
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+  }
+  input, textarea, button {
+    border-radius: 8px;
+    border: none;
+    padding: 0.6rem;
+    margin-top: 0.5rem;
+  }
+  button {
+    background: linear-gradient(to right, #3b82f6, #6366f1);
+    color: white;
+    cursor: pointer;
+  }
+  .bubble {
+    background: #334155;
+    padding: 0.8rem;
+    border-radius: 10px;
+    margin: 0.5rem 0;
+  }
+  .user { background: #3b82f6; align-self: flex-end; }
+</style>
+</head>
+<body>
+  <h1>💬 RAG Document Assistant</h1>
+  <div id="container">
+    <div id="upload">
+      <h3>📄 Upload PDF(s)</h3>
+      <input type="file" id="file" multiple />
+      <button onclick="upload()">Upload</button>
+      <h4>Uploaded Files</h4>
+      <ul id="fileList"></ul>
+    </div>
+
+    <div id="chat">
+      <h3>🧠 Conversation</h3>
+      <div id="conversation" style="flex:1;overflow:auto;"></div>
+      <input type="text" id="question" placeholder="Ask about uploaded documents..." />
+      <button onclick="ask()">Ask</button>
+    </div>
+  </div>
+
+<script>
+async function upload() {
+  const files = document.getElementById('file').files;
+  for (const file of files) {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch('/upload', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (data.ok) {
+      const li = document.createElement('li');
+      li.textContent = file.name;
+      document.getElementById('fileList').appendChild(li);
+    }
+  }
+}
+
+async function ask() {
+  const question = document.getElementById('question').value;
+  if (!question.trim()) return;
+
+  const convo = document.getElementById('conversation');
+  const userBubble = document.createElement('div');
+  userBubble.className = 'bubble user';
+  userBubble.textContent = question;
+  convo.appendChild(userBubble);
+
+  const formData = new FormData();
+  formData.append('question', question);
+  const res = await fetch('/ask', { method: 'POST', body: formData });
+  const data = await res.json();
+
+  const botBubble = document.createElement('div');
+  botBubble.className = 'bubble';
+  botBubble.textContent = data.answer || 'No answer (backend error)';
+  convo.appendChild(botBubble);
+
+  convo.scrollTop = convo.scrollHeight;
+}
+</script>
+</body>
+</html>

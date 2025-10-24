@@ -1,0 +1,720 @@
+# app/rag_pipeline.py
+"""
+Chromadb-compatible RAG pipeline (final cleaned version):
+- Default Ollama model: mistral:7b (configurable via OLLAMA_MODEL)
+- Safe local arithmetic evaluation (avoids model guessing math)
+- Short-question direct path (bypasses retrieval) for concise queries
+- Environment-configurable prompt mode via RAG_PROMPT_MODE
+- Supports various chromadb client versions and robust Ollama call paths
+"""
+
+import ast
+import os
+import time
+import logging
+from pathlib import Path
+from typing import Any, List, Optional
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import requests
+import numpy as np
+
+# Optional imports
+try:
+    import chromadb
+    CHROMADB_OK = True
+except Exception:
+    chromadb = None
+    CHROMADB_OK = False
+
+try:
+    from sentence_transformers import SentenceTransformer
+    HF_OK = True
+    HF_MODEL_NAME = os.environ.get("HF_EMBED_MODEL", "all-MiniLM-L6-v2")
+except Exception:
+    SentenceTransformer = None
+    HF_OK = False
+    HF_MODEL_NAME = None
+
+# LangChain Ollama wrapper (optional)
+try:
+    from langchain.llms import Ollama
+    OLLAMA_LANGCHAIN_OK = True
+except Exception:
+    Ollama = None
+    OLLAMA_LANGCHAIN_OK = False
+
+# Official ollama client (optional)
+try:
+    import ollama as ollama_client
+    OLLAMA_CLIENT_OK = True
+except Exception:
+    ollama_client = None
+    OLLAMA_CLIENT_OK = False
+
+# defaults and directories
+BASE = Path(__file__).parent
+UPLOAD_DIR = BASE / "sample_data" / "uploads"
+VECTOR_DIR = BASE / "vector_store"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+VECTOR_DIR.mkdir(parents=True, exist_ok=True)
+
+# logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# module-level state
+_client = None
+_collection = None
+_COLLECTION_NAME = "rag_docs"
+_chromadb_lock = threading.Lock()
+
+_hf_model = None
+_executor = ThreadPoolExecutor(max_workers=2)
+
+_last_sources: List[str] = []
+
+# Prompt mode (env): summary | strict | qa (default)
+RAG_PROMPT_MODE = os.environ.get("RAG_PROMPT_MODE", "qa").lower()
+# Default Ollama model (env-overridable)
+DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "mistral:7b")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+
+
+def get_last_sources() -> List[str]:
+    return _last_sources.copy()
+
+
+def _mock_answer(query: str) -> str:
+    return f"(demo) Mock answer for: \"{query}\". Install/run Ollama or set OPENAI_API_KEY for real answers."
+
+
+def is_ollama_up(host: str = OLLAMA_HOST) -> bool:
+    try:
+        r = requests.get(f"{host}/v1/models", timeout=1.0)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def get_hf_model():
+    global _hf_model
+    if not HF_OK:
+        return None
+    if _hf_model is None:
+        _hf_model = SentenceTransformer(HF_MODEL_NAME)
+    return _hf_model
+
+
+# ---------------- safe arithmetic helpers ----------------
+_ALLOWED_AST_NODES = {
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num, ast.Constant,
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod,
+    ast.UAdd, ast.USub, ast.Load, ast.FloorDiv
+}
+
+
+def _is_simple_arithmetic(s: str) -> bool:
+    try:
+        node = ast.parse(s, mode='eval')
+    except Exception:
+        return False
+    for n in ast.walk(node):
+        if type(n) not in _ALLOWED_AST_NODES:
+            return False
+    return True
+
+
+def _eval_simple_arithmetic(s: str) -> Optional[Any]:
+    if not _is_simple_arithmetic(s):
+        return None
+    try:
+        compiled = compile(ast.parse(s, mode='eval'), '<string>', 'eval')
+        return eval(compiled, {"__builtins__": {}})
+    except Exception:
+        return None
+
+
+# ---------------- Chromadb init (support new and old APIs) ----------------
+def init_chromadb_client(retries: int = 1, backoff: float = 0.5) -> bool:
+    global _client, _collection
+    if not CHROMADB_OK:
+        logger.info("chromadb not available (CHROMADB_OK=False)")
+        return False
+
+    with _chromadb_lock:
+        if _client is None:
+            # Try new API: PersistentClient or Client(path=...)
+            try:
+                try:
+                    _client = chromadb.PersistentClient(path=str(VECTOR_DIR))
+                    logger.info("Chromadb PersistentClient initialized.")
+                except Exception:
+                    _client = chromadb.Client(path=str(VECTOR_DIR))
+                    logger.info("Chromadb Client initialized with path.")
+            except Exception:
+                logger.exception("Chromadb init failed (new API). Retrying/fallback.")
+                for i in range(retries):
+                    time.sleep(backoff * (i + 1))
+                    try:
+                        _client = chromadb.PersistentClient(path=str(VECTOR_DIR))
+                        logger.info("Chromadb PersistentClient initialized (retry).")
+                        break
+                    except Exception:
+                        logger.exception("Chromadb init retry failed (new API)")
+                if _client is None:
+                    try:
+                        from chromadb.config import Settings  # type: ignore
+                        settings = Settings(chroma_db_impl="duckdb+parquet", persist_directory=str(VECTOR_DIR))
+                        _client = chromadb.Client(settings)
+                        logger.info("Chromadb legacy Settings client initialized (fallback).")
+                    except Exception:
+                        logger.exception("Chromadb legacy fallback failed")
+                        _client = None
+                        return False
+
+        if _collection is None:
+            try:
+                try:
+                    _collection = _client.get_collection(name=_COLLECTION_NAME)
+                    logger.info("Chromadb collection loaded.")
+                except Exception:
+                    try:
+                        _collection = _client.create_collection(name=_COLLECTION_NAME)
+                        logger.info("Chromadb collection created.")
+                    except Exception:
+                        _collection = _client.get_collection(name=_COLLECTION_NAME)
+                        logger.info("Chromadb collection loaded (fallback).")
+            except Exception:
+                logger.exception("Chromadb collection create/load failed")
+                return False
+
+    return True
+
+
+def persist_chromadb():
+    try:
+        global _client
+        if _client is not None:
+            try:
+                _client.persist()
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("chromadb persist failed")
+
+
+# ---------------- utility helpers ----------------
+def _atomic_write(path: Path, text: str):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def _embed_chunks_threadsafe(chunks: List[str], timeout: int = 300):
+    model = get_hf_model()
+    if model is None:
+        raise RuntimeError("HF model not available")
+    fut = _executor.submit(lambda: model.encode(chunks, show_progress_bar=False))
+    try:
+        vectors = fut.result(timeout=timeout)
+        return vectors
+    except TimeoutError:
+        fut.cancel()
+        raise
+    except Exception:
+        raise
+
+
+def _embed_query_threadsafe(query: str, timeout: int = 60):
+    model = get_hf_model()
+    if model is None:
+        raise RuntimeError("HF model not available")
+    fut = _executor.submit(lambda: model.encode([query], show_progress_bar=False))
+    try:
+        vectors = fut.result(timeout=timeout)
+        return vectors[0]
+    except TimeoutError:
+        fut.cancel()
+        raise
+    except Exception:
+        raise
+
+
+# ---------------- Ollama HTTP helper ----------------
+def call_ollama_http(prompt: str, model_name: str, host: str = "http://127.0.0.1:11434", timeout: int = 60) -> str:
+    """
+    Robust Ollama HTTP caller.
+    - Attempts several known endpoints.
+    - Supports NDJSON / streaming chunked responses and single JSON bodies.
+    - Returns a single string with the assistant response (joined if streamed).
+    - Raises RuntimeError on failure.
+    """
+    import json
+
+    endpoints = [
+        (f"{host}/api/chat", {"model": model_name, "messages": [{"role": "user", "content": prompt}]}),
+        (f"{host}/api/chat/completions", {"model": model_name, "messages": [{"role": "user", "content": prompt}]}),
+        (f"{host}/api/generate", {"model": model_name, "prompt": prompt}),
+        (f"{host}/api/complete", {"model": model_name, "prompt": prompt}),
+        (f"{host}/v1/chat", {"model": model_name, "messages": [{"role": "user", "content": prompt}]}),
+        (f"{host}/v1/chat/completions", {"model": model_name, "messages": [{"role": "user", "content": prompt}]}),
+        (f"{host}/v1/generate", {"model": model_name, "prompt": prompt}),
+        (f"{host}/v1/complete", {"model": model_name, "prompt": prompt}),
+    ]
+
+    def _extract_text_from_obj(obj) -> str:
+        """Try many common shapes and return the text found, else ''."""
+        if not obj:
+            return ""
+        if isinstance(obj, dict):
+            # choices -> choices[0].message.content or choices[0].text
+            if "choices" in obj and isinstance(obj["choices"], list) and obj["choices"]:
+                first = obj["choices"][0]
+                if isinstance(first, dict):
+                    if "message" in first and isinstance(first["message"], dict):
+                        return first["message"].get("content", "") or ""
+                    if "text" in first and isinstance(first["text"], str):
+                        return first.get("text", "") or ""
+                return str(first)
+            # results -> results[0].content / output
+            if "results" in obj and isinstance(obj["results"], list) and obj["results"]:
+                r0 = obj["results"][0]
+                if isinstance(r0, dict):
+                    content = r0.get("content")
+                    if isinstance(content, dict):
+                        return content.get("text", "") or ""
+                    if isinstance(content, str):
+                        return content
+                    out = r0.get("output")
+                    if isinstance(out, str):
+                        return out
+                    if isinstance(out, list) and out:
+                        first_out = out[0]
+                        if isinstance(first_out, dict):
+                            return first_out.get("text", "") or ""
+                        return str(first_out)
+                return str(r0)
+            # message key (chat)
+            if "message" in obj and isinstance(obj["message"], dict):
+                return obj["message"].get("content", "") or ""
+            # legacy single fields
+            if "response" in obj and isinstance(obj["response"], str):
+                return obj.get("response", "") or ""
+            if "text" in obj and isinstance(obj["text"], str):
+                return obj["text"]
+        if isinstance(obj, str):
+            return obj
+        return ""
+
+    last_err = None
+    for url, payload in endpoints:
+        try:
+            logger.info("Ollama HTTP call to %s (payload keys: %s) timeout=%s", url,
+                        list(payload.keys()) if isinstance(payload, dict) else [], timeout)
+            # Stream response so we can support NDJSON / chunked responses
+            with requests.post(url, json=payload, timeout=timeout, stream=True) as r:
+                status = r.status_code
+                if status != 200:
+                    try:
+                        body_snip = r.text[:500]
+                    except Exception:
+                        body_snip = "<no-body>"
+                    logger.info("Ollama endpoint %s returned %s: %.200s", url, status, body_snip)
+                    last_err = RuntimeError(f"HTTP {status}: {body_snip}")
+                    continue
+
+                # Collect pieces from streaming lines or chunked responses
+                pieces = []
+                try:
+                    for raw in r.iter_lines(decode_unicode=True):
+                        if not raw:
+                            continue
+                        # Attempt to parse each line as JSON
+                        try:
+                            chunk_obj = json.loads(raw)
+                            txt = _extract_text_from_obj(chunk_obj)
+                            if txt:
+                                pieces.append(txt)
+                            else:
+                                # fallback: try known keys
+                                if isinstance(chunk_obj, dict):
+                                    for k in ("response", "text", "content"):
+                                        if k in chunk_obj and isinstance(chunk_obj[k], str):
+                                            pieces.append(chunk_obj[k])
+                                            break
+                        except Exception:
+                            # not JSON — include raw line
+                            s = raw.strip()
+                            if s:
+                                pieces.append(s)
+
+                    if pieces:
+                        joined = "".join(pieces).strip()
+                        if joined:
+                            return joined
+
+                    # If no streaming pieces, try to parse full body as JSON
+                    try:
+                        full = r.content.decode(errors="ignore")
+                        if full:
+                            try:
+                                obj = json.loads(full)
+                                # If it's a list, try to combine
+                                if isinstance(obj, list):
+                                    out_parts = []
+                                    for elt in obj:
+                                        out_parts.append(_extract_text_from_obj(elt))
+                                    joined = "".join([p for p in out_parts if p]).strip()
+                                    if joined:
+                                        return joined
+                                else:
+                                    txt = _extract_text_from_obj(obj)
+                                    if txt:
+                                        return txt
+                            except Exception:
+                                # not JSON or parse failed — return raw body if non-empty
+                                if full.strip():
+                                    return full.strip()
+                    except Exception:
+                        # ignore and allow next endpoint attempt
+                        pass
+
+                    # If we reached here, this endpoint returned 200 but we couldn't parse content
+                    last_err = RuntimeError("No parsable content from endpoint")
+                    continue
+
+        except Exception as e:
+            logger.info("Ollama HTTP call to %s failed to connect: %s", url, e)
+            last_err = e
+            continue
+
+    # If all endpoints failed
+    raise RuntimeError(f"No working Ollama HTTP endpoint found or parse failures. Last error: {last_err}")
+
+
+# ---------------- ingestion ----------------
+def ingest_file(file_path: str) -> dict:
+    global _last_sources
+    logger.info("Starting ingestion for %s", file_path)
+    file_path = str(file_path)
+
+    text = ""
+    if file_path.lower().endswith(".pdf"):
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(file_path)
+            pages = []
+            for p in reader.pages:
+                txt = p.extract_text() or ""
+                pages.append(txt)
+            text = "\n".join(pages)
+        except Exception:
+            logger.exception("PDF extraction failed")
+            text = ""
+    else:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except Exception:
+            logger.exception("Text read failed")
+            text = ""
+
+    if not text.strip():
+        msg = "No text found in file."
+        logger.warning(msg)
+        return {"ok": False, "msg": msg}
+
+    chunk_size = 800
+    overlap = 50
+    chunks: List[str] = []
+    i = 0
+    while i < len(text):
+        chunk = text[i:i + chunk_size]
+        chunks.append(chunk)
+        i += chunk_size - overlap
+
+    if not HF_OK:
+        _last_sources = [f"(mock) Ingested: {Path(file_path).name} (HF missing)"]
+        logger.info("HF not available - ingest mocked")
+        return {"ok": True, "msg": "Ingested (mock). Install sentence-transformers for real embeddings."}
+
+    try:
+        vectors = _embed_chunks_threadsafe(chunks, timeout=300)
+        vectors = [np.array(v).astype("float32").tolist() for v in vectors]
+    except Exception:
+        logger.exception("Embedding failed")
+        _last_sources = [f"(mock) Ingested: {Path(file_path).name} (embedding failed)"]
+        return {"ok": False, "msg": "Embedding failed."}
+
+    if not init_chromadb_client():
+        _last_sources = [f"(mock) Ingested: {Path(file_path).name} (chromadb missing)"]
+        logger.info("chromadb not available - ingestion mocked")
+        return {"ok": True, "msg": "Ingested (mock). Install chromadb for local vectorstore."}
+
+    ids, metadatas, documents = [], [], []
+    for idx, chunk in enumerate(chunks):
+        uid = f"{Path(file_path).name}__{idx}"
+        ids.append(uid)
+        metadatas.append({"source": Path(file_path).name, "chunk": idx})
+        documents.append(chunk)
+
+    try:
+        try:
+            _collection.add(ids=ids, metadatas=metadatas, documents=documents, embeddings=vectors)
+        except Exception:
+            _collection.add(ids, documents, metadatas, vectors)
+        persist_chromadb()
+        _last_sources = [f"Ingested and saved to chromadb: {Path(file_path).name}"]
+        logger.info("Ingested %d chunks into chromadb", len(chunks))
+        return {"ok": True, "msg": "Created local chromadb vectorstore."}
+    except Exception:
+        logger.exception("chromadb add failed")
+        _last_sources = [f"(mock) Ingested: {Path(file_path).name} (chromadb add failed)"]
+        return {"ok": False, "msg": "Chromadb add failed."}
+
+
+def ingest_and_update_status(file_path: str, status_path: str):
+    status_p = Path(status_path)
+    try:
+        _atomic_write(status_p, "pending")
+        res = ingest_file(file_path)
+        if res.get("ok"):
+            _atomic_write(status_p, "ok")
+        else:
+            _atomic_write(status_p, f"error:{res.get('msg')}")
+    except Exception as e:
+        logger.exception("Background ingest failed")
+        try:
+            _atomic_write(status_p, f"error:{str(e)}")
+        except Exception:
+            pass
+
+
+# ---------------- query / answer ----------------
+def answer_query(query: str, k: int = 3, context_chars: int = 1000) -> str:
+    global _last_sources
+    start = time.time()
+
+    # 1) Safe arithmetic fast-path (local)
+    arith_result = _eval_simple_arithmetic(query.strip())
+    if arith_result is not None:
+        _last_sources = ["(local) arithmetic"]
+        return str(arith_result)
+
+    # 2) Short-question direct path: small token count and not a summarization/explain request
+    tokens_len = len(query.strip().split())
+    if tokens_len <= 6 and all(w.lower() not in query.lower() for w in ("explain", "summarize", "compare", "describe")):
+        direct_prompt = f"Answer concisely and directly: {query.strip()}"
+        if is_ollama_up():
+            try:
+                model_name = os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+                text = call_ollama_http(direct_prompt, model_name=model_name, host=OLLAMA_HOST, timeout=15)
+                _last_sources = ["(direct) ollama"]
+                return text
+            except Exception:
+                logger.exception("Direct Ollama call failed for short question; falling back to retrieval.")
+
+    # If chromadb or HF not available, fallback/mock
+    if not CHROMADB_OK:
+        _last_sources = ["(mock) chromadb not installed."]
+        return _mock_answer(query)
+    if not init_chromadb_client():
+        _last_sources = ["(mock) chromadb init failed."]
+        return _mock_answer(query)
+    if not HF_OK:
+        _last_sources = ["(mock) sentence-transformers not installed."]
+        return _mock_answer(query)
+
+    # Embed query
+    try:
+        q_vec = _embed_query_threadsafe(query, timeout=60)
+        q_vec = np.array(q_vec).astype("float32").tolist()
+    except Exception:
+        logger.exception("Query embedding failed")
+        _last_sources = ["(mock) Query embedding failed"]
+        return _mock_answer(query)
+
+    # Query chromadb
+    try:
+        try:
+            res = _collection.query(query_embeddings=[q_vec], n_results=k, include=['documents', 'metadatas', 'distances'])
+        except Exception:
+            res = _collection.query([q_vec], n_results=k, include=['documents', 'metadatas', 'distances'])
+    except Exception:
+        logger.exception("Chromadb query failed")
+        _last_sources = ["(mock) chromadb query failed"]
+        return _mock_answer(query)
+
+    # Parse results
+    try:
+        if isinstance(res, dict):
+            docs = res.get('documents', [[]])[0]
+            metadatas = res.get('metadatas', [[]])[0]
+        else:
+            docs = res.documents[0] if hasattr(res, "documents") else []
+            metadatas = res.metadatas[0] if hasattr(res, "metadatas") else []
+    except Exception:
+        logger.exception("Parsing chromadb response failed")
+        _last_sources = ["(mock) chromadb parse failed"]
+        return _mock_answer(query)
+
+    if not docs:
+        _last_sources = ["No docs found in vectorstore."]
+        return "No indexed documents found. Upload a PDF/TXT to ingest."
+
+    # Build prompt header by RAG_PROMPT_MODE
+    if RAG_PROMPT_MODE == "summary":
+        header = (
+            "You are a professional summarizer. Read the context below and produce a 1-2 sentence summary.\n"
+            "Do not add information not present in the text.\n\n"
+        )
+    elif RAG_PROMPT_MODE == "strict":
+        header = (
+            "You are an expert assistant. Use ONLY the provided context excerpts to answer the question.\n"
+            "If the answer is explicitly present in the context, answer concisely and cite the source(s).\n"
+            "If the answer is NOT in the provided context, reply exactly: \"I don't know.\" Do not guess.\n\n"
+        )
+    else:  # default 'qa'
+        header = (
+            "You are a helpful assistant. Use the provided context excerpts to answer the question clearly and concisely.\n"
+            "If the context doesn't contain the answer, respond: \"I don't know.\" Avoid speculation.\n\n"
+        )
+
+    prompt = header
+    srcs: List[str] = []
+    for i, doc in enumerate(docs):
+        meta = metadatas[i] if i < len(metadatas) else {}
+        excerpt = doc[:context_chars]
+        srcs.append(f"{meta.get('source', '?')} — chunk {meta.get('chunk', '?')}")
+        prompt += f"Context {i+1} ({meta.get('source','?')} chunk {meta.get('chunk','?')}):\n{excerpt}\n\n"
+
+    prompt += f"Task: Answer the question concisely using ONLY the context above.\nQuestion: {query}\n\nAnswer:"
+
+    _last_sources = srcs
+
+    # Prefer live Ollama
+    if is_ollama_up():
+        # Try official client first (do not pass unsupported kwargs)
+        if OLLAMA_CLIENT_OK and ollama_client is not None:
+            try:
+                model_name = os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+                # call WITHOUT a 'timeout' kwarg (some client versions reject it)
+                resp = ollama_client.chat(model=model_name, messages=[{"role": "user", "content": prompt}])
+                # Parse typical response shapes
+                if isinstance(resp, dict):
+                    msg = resp.get("message", {})
+                    if isinstance(msg, dict):
+                        content = msg.get("content") or msg.get("text") or ""
+                        if content:
+                            return content
+                    if "choices" in resp and isinstance(resp["choices"], list) and resp["choices"]:
+                        first = resp["choices"][0]
+                        if isinstance(first, dict):
+                            if "message" in first and isinstance(first["message"], dict):
+                                return first["message"].get("content", "") or str(first)
+                            if "text" in first:
+                                return first.get("text", "")
+                        return str(first)
+                # fallback to string
+                return str(resp)
+            except TypeError as te:
+                # Signature mismatch (e.g. unexpected kwarg) - fall back to HTTP path
+                logger.info("Ollama client.chat() TypeError (signature mismatch): %s", te)
+            except Exception:
+                logger.exception("Ollama client chat failed - falling back to HTTP")
+
+        # LangChain wrapper
+        if OLLAMA_LANGCHAIN_OK and Ollama is not None:
+            try:
+                llm = Ollama(model=os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL))
+                out = llm(prompt)
+                return str(out)
+            except Exception:
+                logger.exception("LangChain Ollama wrapper failed - falling back to HTTP")
+
+        # Robust HTTP fallback
+        try:
+            model_name = os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+            return call_ollama_http(prompt, model_name=model_name, host=OLLAMA_HOST, timeout=60)
+        except Exception as e:
+            logger.exception("Ollama HTTP call failed: %s", e)
+            _last_sources = [f"(mock) Ollama HTTP failed: {e}"]
+            return _mock_answer(query)
+    else:
+        _last_sources = ["(mock) Ollama not running"]
+        return _mock_answer(query)
+
+
+# ---------------- utilities for status & detection ----------------
+def detect_engine() -> str:
+    try:
+        if is_ollama_up():
+            return "ollama"
+    except Exception:
+        pass
+    if HF_OK:
+        return "local-hf"
+    if CHROMADB_OK:
+        return "chromadb-only"
+    return "mock"
+
+
+def get_collection_size() -> int:
+    try:
+        if init_chromadb_client() and _collection is not None:
+            try:
+                try:
+                    return int(_collection.count())
+                except Exception:
+                    try:
+                        res = _collection.get(include=['ids'])
+                        ids = res.get('ids', [])
+                        return len(ids)
+                    except Exception:
+                        try:
+                            res = _collection.get()
+                            ids = res.get('ids') if isinstance(res, dict) else getattr(res, "ids", None)
+                            if ids:
+                                return len(ids)
+                        except Exception:
+                            return 0
+            except Exception:
+                return 0
+        return 0
+    except Exception:
+        return 0
+
+
+def status() -> dict:
+    try:
+        ollama_up = False
+        try:
+            ollama_up = is_ollama_up()
+        except Exception:
+            ollama_up = False
+
+        size = get_collection_size()
+        return {
+            "chromadb": CHROMADB_OK,
+            "hf": HF_OK,
+            "ollama": ollama_up,
+            "vector_store_count": size,
+            "vector_store_exists": VECTOR_DIR.exists() and any(VECTOR_DIR.iterdir())
+        }
+    except Exception:
+        return {
+            "chromadb": CHROMADB_OK,
+            "hf": HF_OK,
+            "ollama": False,
+            "vector_store_count": None,
+            "vector_store_exists": VECTOR_DIR.exists() if 'VECTOR_DIR' in globals() else False
+        }
+
+
+def shutdown_executor(wait: bool = True):
+    try:
+        _executor.shutdown(wait=wait)
+        logger.info("ThreadPoolExecutor shut down.")
+    except Exception:
+        logger.exception("Error shutting down executor")
